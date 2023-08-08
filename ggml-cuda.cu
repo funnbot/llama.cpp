@@ -7,9 +7,11 @@
 #include <assert.h>
 
 #if defined(GGML_USE_HIPBLAS)
+
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 #include <hip/hip_fp16.h>
+#include <hip/device_functions.h>
 #ifdef __HIP_PLATFORM_AMD__
 // for rocblas_initialize()
 #include "rocblas/rocblas.h"
@@ -64,6 +66,95 @@
 #define cudaStreamWaitEvent(stream, event) hipStreamWaitEvent(stream, event, 0)
 #define cudaStream_t hipStream_t
 #define cudaSuccess hipSuccess
+#define cublasGetStatusString hipblasStatusToString
+
+/*
+// From cuda docs:
+__device__ ​ int __dp4a ( int  srcA, int  srcB, int  c )
+    Four-way signedint8 dot product with int32 accumulate.
+    Description
+
+    Extracts four pairs of packed byte-sized integers from scrA and srcB, then creates four pairwise products and adds them together to a signed 32-bit integer c.
+*/
+
+
+#define __CUDA_ARCH__ 12020
+
+static __device__ __forceinline__ int32_t __dp4a(int32_t srcA, int32_t srcB, int32_t c) {
+    return amd_mixed_dot(srcA, srcB, c, /*saturate=*/ true);
+}
+
+// https://github.com/intel/llvm/blob/8e0cc4b7a845df9389a1313a3e680babc4d87782/sycl/source/detail/builtins_integer.cpp#L218
+static __device__ __forceinline__ int8_t s_sub_sat(int8_t x, int8_t y) {
+  int8_t result = uint8_t(x) - uint8_t(y);
+  // Saturate result if (+) - (-) = (-) or (-) - (+) = (+).
+  if (((x < 0) ^ (y < 0)) && ((x < 0) ^ (result < 0))) {
+    result = result < 0 ? std::numeric_limits<int8_t>::max() : std::numeric_limits<int8_t>::min();
+  }
+  return result;
+}
+
+/*
+// From cuda docs:
+__device__ ​ unsigned int __vsubss4 ( unsigned int  a, unsigned int  b )
+    Performs per-byte subtraction with signed saturation.
+    Returns
+
+    Returns computed value.
+    Description
+
+    Splits 4 bytes of each argument into 4 parts, each consisting of 1 byte. For corresponding parts function performs subtraction with signed saturation. Partial results are recombined and returned as unsigned int. 
+*/
+static __device__ __forceinline__ uint32_t __vsubss4(uint32_t a, uint32_t b) {
+    // Is this more correct? (Didn't fix mmq)
+    int32_t r;
+    __asm__("v_sub_nc_i32 %0,%1,%2,clamp;"
+        : "=v"(r)
+        : "r"(a), "r"(b));
+
+    return r;
+
+    // Suggested instruction (Didn't fix mmq)
+    // uint32_t r;
+    // __asm__("v_sub_nc_u32 %0,%1,%2;"
+    //     : "=v"(r)
+    //     : "r"(a), "r"(b));
+    // return r;
+
+    /// Proper hip types (Didn't fix mmq)
+    // char4 a4 = mapFrom<char4, uint32_t>(a);
+    // char4 b4 = mapFrom<char4, uint32_t>(b);
+    // char4 c = char4{
+    //     s_sub_sat(a4.x, b4.x),
+    //     s_sub_sat(a4.y, b4.y),
+    //     s_sub_sat(a4.z, b4.z),
+    //     s_sub_sat(a4.w, b4.w),
+    // };
+    // return mapFrom<uint32_t, char4>(c);
+
+    /// Bitwise (Didn't fix mmq)
+    // return (
+    //     (s_sub_sat(a, b) & 0xFF) |
+    //     ((s_sub_sat(a >> 8, b >> 8) << 8) & 0xFF00) |
+    //     ((s_sub_sat(a >> 16, b >> 16) << 16) & 0xFF0000) |
+    //     ((s_sub_sat(a >> 24, b >> 24) << 24) & 0xFF000000)
+    // );
+    
+    /// From github comment (Didn't fix mmq)
+    // typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
+    // int8x4_t ap = int8x4_t(a);
+    // int8x4_t bp = int8x4_t(b);
+    // int8x4_t c = { 
+    //     s_sub_sat(ap.x, bp.x), 
+    //     s_sub_sat(ap.y, bp.y), 
+    //     s_sub_sat(ap.z, bp.z), 
+    //     s_sub_sat(ap.w, bp.w) };
+    // return *(unsigned int*)(&c);
+}
+
+#define CUDART_VERSION 12020
+#define CUDA_VERSION 12020
+
 #else
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -111,6 +202,37 @@ static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
         }                                                                               \
     } while (0)
 #endif // CUDART_VERSION >= 11
+
+#ifdef __HIPCC__
+#define CUDA_PRINT(__FORMAT, ...)              \
+        printf("[tid.x=<%d> tid.y=<%d> bid.x=<%d> bid.y=<%d>]: " __FORMAT "\n", \
+        hipThreadIdx_x, hipThreadIdx_y, hipBlockIdx_x, hipBlockIdx_y, ##__VA_ARGS__);
+#else
+#define CUDA_PRINT(__FORMAT, ...)              \
+        printf("[tid.x=<%d> tid.y=<%d> bid.x=<%d> bid.y=<%d>]: " __FORMAT "\n", \
+        threadIdx.x, threadIdx.y, blockIdx.x, blockIdx.y, ##__VA_ARGS__);
+#endif
+
+namespace {
+    struct ggml_half2: public half2 {
+        using half2::half2;
+
+        __host__ __device__ __forceinline__ __half x() const {
+            return __low2half(*this);
+        }
+        __host__ __device__ __forceinline__ __half y() const {
+            return __high2half(*this);
+        }
+        __host__ __device__ __forceinline__ void x(const half& v) {
+            *reinterpret_cast<half*>(&this->half2::x) = v;
+        }
+        __host__ __device__ __forceinline__ void y(const half& v) {
+            *reinterpret_cast<half*>(&this->half2::y) = v;
+        }
+    };
+}
+
+#define half2 ggml_half2
 
 #ifdef GGML_CUDA_F16
 typedef half dfloat; // dequantize float
@@ -472,8 +594,8 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int ib, const int iqs, dfloat2 & v){
     const block_q4_1 * x = (const block_q4_1 *) vx;
 
-    const dfloat d = __low2half(x[ib].dm);
-    const dfloat m = __high2half(x[ib].dm);
+    const dfloat d = x[ib].dm.x();
+    const dfloat m = x[ib].dm.y();
 
     const int vui = x[ib].qs[iqs];
 
@@ -515,8 +637,8 @@ static __device__ __forceinline__ void dequantize_q5_0(const void * vx, const in
 static __device__ __forceinline__ void dequantize_q5_1(const void * vx, const int ib, const int iqs, dfloat2 & v){
     const block_q5_1 * x = (const block_q5_1 *) vx;
 
-    const dfloat d = __low2half(x[ib].dm);
-    const dfloat m = __high2half(x[ib].dm);
+    const dfloat d = x[ib].dm.x();
+    const dfloat m = x[ib].dm.y();
 
     uint32_t qh;
     memcpy(&qh, x[ib].qh, sizeof(qh));
@@ -568,8 +690,8 @@ static __global__ void dequantize_block_q2_K(const void * __restrict__ vx, float
     const uint8_t q = x[i].qs[32*n + l];
     float * y = yy + i*QK_K + 128*n;
 
-    float dall = __low2half(x[i].dm);
-    float dmin = __high2half(x[i].dm);
+    float dall = x[i].dm.x();
+    float dmin = x[i].dm.y();
     y[l+ 0] = dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4);
     y[l+32] = dall * (x[i].scales[is+2] & 0xF) * ((q >> 2) & 3) - dmin * (x[i].scales[is+2] >> 4);
     y[l+64] = dall * (x[i].scales[is+4] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+4] >> 4);
@@ -666,8 +788,8 @@ static __global__ void dequantize_block_q4_K(const void * __restrict__ vx, float
 
     float * y = yy + i*QK_K + 64*il + n*ir;
 
-    const float dall = __low2half(x[i].dm);
-    const float dmin = __high2half(x[i].dm);
+    const float dall = x[i].dm.x();
+    const float dmin = x[i].dm.y();
 
     const uint8_t * q = x[i].qs + 32*il + n*ir;
 
@@ -705,8 +827,8 @@ static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, float
 
     float * y = yy + i*QK_K + 64*il + 2*ir;
 
-    const float dall = __low2half(x[i].dm);
-    const float dmin = __high2half(x[i].dm);
+    const float dall = x[i].dm.x();
+    const float dmin = x[i].dm.y();
 
     const uint8_t * ql = x[i].qs + 32*il + 2*ir;
     const uint8_t * qh = x[i].qh + 2*ir;
@@ -818,8 +940,8 @@ static __global__ void dequantize_mul_mat_vec_q2_k(const void * __restrict__ vx,
         const float   * y = yy + i * QK_K + y_offset;
         const uint8_t * q = x[i].qs + q_offset;
 
-        const float dall = __low2half(x[i].dm);
-        const float dmin = __high2half(x[i].dm);
+        const float dall = x[i].dm.x();
+        const float dmin = x[i].dm.y();
 
         const uint32_t * a = (const uint32_t *)(x[i].scales + s_offset);
         aux[0] = a[0] & 0x0f0f0f0f;
@@ -1039,8 +1161,8 @@ static __global__ void dequantize_mul_mat_vec_q4_k(const void * __restrict__ vx,
         const float   * y1 = yy + i*QK_K + y_offset;
         const float   * y2 = y1 + 128;
 
-        const float dall = __low2half(x[i].dm);
-        const float dmin = __high2half(x[i].dm);
+        const float dall = x[i].dm.x();
+        const float dmin = x[i].dm.y();
 
         const uint16_t * a = (const uint16_t *)x[i].scales;
         aux[0] = a[im+0] & kmask1;
@@ -1172,8 +1294,8 @@ static __global__ void dequantize_mul_mat_vec_q5_k(const void * __restrict__ vx,
         const float   * y1  = yy + i*QK_K + y_offset;
         const float   * y2  = y1 + 128;
 
-        const float dall = __low2half(x[i].dm);
-        const float dmin = __high2half(x[i].dm);
+        const float dall = x[i].dm.x();
+        const float dmin = x[i].dm.y();
 
         const uint16_t * a = (const uint16_t *)x[i].scales;
         aux[0] = a[im+0] & kmask1;
@@ -1396,8 +1518,8 @@ static __global__ void quantize_q8_1(const float * __restrict__ x, void * __rest
         return;
     }
 
-    y[ib].ds.x = d;
-    y[ib].ds.y = sum;
+    y[ib].ds.x(d);
+    y[ib].ds.y(sum);
 }
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
@@ -1609,8 +1731,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
 #else
     const float2 dm8f = __half22float2(dm8);
     const float2 ds8f = __half22float2(ds8);
-    const float d8d8 = dm8.x * ds8.x;
-    const float m8s8 = dm8.y * ds8.y;
+    const float d8d8 = dm8.x() * ds8.x();
+    const float m8s8 = dm8.y() * ds8.y();
 #endif // GGML_CUDA_F16
 
     // scale second part of sum by QI8_1/ vdr to compensate for multiple threads adding it
@@ -2380,7 +2502,7 @@ static __device__ __forceinline__ float vec_dot_q8_0_q8_1(
         u[i] = get_int_from_int8_aligned(bq8_1->qs, iqs + i);
     }
 
-    return vec_dot_q8_0_q8_1_impl<VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, bq8_1->ds.x);
+    return vec_dot_q8_0_q8_1_impl<VDR_Q8_0_Q8_1_MMVQ>(v, u, bq8_0->d, bq8_1->ds.x());
 }
 
 static __device__ __forceinline__ void allocate_tiles_q8_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {
@@ -2478,7 +2600,7 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1(
 #pragma unroll
     for (int i = 0; i < QR2_K; ++ i) {
         u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
-        d8[i] = bq8_1[bq8_offset + i].ds.x;
+        d8[i] = bq8_1[bq8_offset + i].ds.x();
     }
 
     return vec_dot_q2_K_q8_1_impl_mmvq(v, u, scales, bq2_K->dm, d8);
@@ -2605,7 +2727,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
 #pragma unroll
     for (int i = 0; i < QR3_K; ++i) {
         u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
-        d8[i] = bq8_1[bq8_offset + i].ds.x;
+        d8[i] = bq8_1[bq8_offset + i].ds.x();
     }
 
     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
@@ -2782,7 +2904,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = bq8i->ds.x;
+        d8[i] = bq8i->ds.x();
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
@@ -2977,7 +3099,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
 #pragma unroll
     for (int i = 0; i < QR5_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
-        d8[i] = bq8i->ds.x;
+        d8[i] = bq8i->ds.x();
 
         const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
         u[2*i+0] = q8[0];
@@ -3157,7 +3279,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 #pragma unroll
     for (int i = 0; i < QR6_K; ++i) {
         u[i]  = get_int_from_int8_aligned(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
-        d8[i] = bq8_1[bq8_offset + 2*i].ds.x;
+        d8[i] = bq8_1[bq8_offset + 2*i].ds.x();
     }
 
     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
@@ -3336,7 +3458,7 @@ static __global__ void mul_mat_q(
                 *dsi_dst = *dsi_src;
             } else {
                 float * dfi_dst = (float *) dsi_dst;
-                *dfi_dst = (*dsi_src).x;
+                *dfi_dst = (*dsi_src).x();
             }
         }
 
